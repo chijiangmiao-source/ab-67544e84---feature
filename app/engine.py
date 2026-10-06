@@ -446,3 +446,137 @@ def analyze(g: Grammar) -> dict:
     static_analysis(g)
     symbol_families, inter_families = build_forest(g)
     return analyze_forest(g, symbol_families, inter_families)
+
+
+# ---------------------------------------------------------------------------
+# Ambiguity witness: first structural divergence of two sealed trees
+# ---------------------------------------------------------------------------
+
+WITNESS_ALIGNMENT_RULE = (
+    "对齐仅依据派生节点的非终结符符号与输入词元跨度 [i,j) 推进："
+    "两树当前节点符号与跨度相同且采用同一产生式时记入共享结构前缀，"
+    "随后在该产生式右部各位置上寻找首个不完全相同的非终结符子节点对继续对齐；"
+    "终结符叶子必须是同一词元位置。首个符号（与跨度）相同但采用不同产生式、"
+    "或同槽位子节点跨度已不同的非终结符节点即为首次分歧点。"
+    "空右部产生式以零跨度节点 [i,i) 参与对齐，左递归展开按其实际消费跨度对齐，"
+    "全程不比较先序产生式编号序列。"
+)
+
+
+def _node_is_nt(node: dict) -> bool:
+    return isinstance(node, dict) and "symbol" in node
+
+
+def _tree_pid_sequence(node: dict) -> List[int]:
+    """Preorder production ids of a rendered derivation tree."""
+    if not _node_is_nt(node):
+        return []
+    out = [node["production"]]
+    for child in node["children"]:
+        out.extend(_tree_pid_sequence(child))
+    return out
+
+
+def _subtree_summary(node: dict) -> dict:
+    """Compact but complete outline of a sealed subtree.
+
+    Every nonterminal summary carries its symbol, token span, chosen
+    production, the preorder production sequence beneath it, and one
+    summary per RHS child (terminal leaves keep token + span), so the
+    reviewer can re-check the continuation chosen on each side.
+    """
+    if not _node_is_nt(node):
+        return {"kind": "terminal", "token": node["token"],
+                "span": list(node["span"])}
+    return {
+        "kind": "nonterminal",
+        "symbol": node["symbol"],
+        "span": list(node["span"]),
+        "production": node["production"],
+        "production_sequence": _tree_pid_sequence(node),
+        "children": [_subtree_summary(c) for c in node["children"]],
+    }
+
+
+def ambiguity_witness(first_tree: dict, second_tree: dict) -> dict:
+    """Re-derive the first divergence point of two sealed finite trees.
+
+    The witness is reconstructed purely from the two already selected
+    derivation trees (the rendered ``tree`` dicts carrying symbol,
+    production, span and children), so it stays consistent with the
+    sealed conclusion across restarts and never re-parses the input.
+
+    Returns the shared structural prefix and the first nonterminal at
+    which the two trees make different choices, together with the
+    production id and subtree summary used on each side.  Raises
+    :class:`ValueError` if the two trees are structurally identical
+    (there is no ambiguity to witness) -- callers must only invoke this
+    for ``AMBIGUOUS_ACCEPTED`` conclusions.
+    """
+    a, b = first_tree, second_tree
+    shared: List[dict] = []
+
+    while True:
+        # Defensive: divergence can only be reported at a nonterminal.
+        if not (_node_is_nt(a) and _node_is_nt(b)):
+            raise ValueError("两棵派生树在终结符叶子处不一致，无法构造非终结符分歧见证")
+
+        same_node = a["symbol"] == b["symbol"] and list(a["span"]) == list(b["span"])
+        if not same_node or a["production"] != b["production"]:
+            break
+
+        shared.append({
+            "symbol": a["symbol"],
+            "production": a["production"],
+            "span": list(a["span"]),
+        })
+
+        # Same production => both children lists follow the same RHS
+        # symbols position by position; skip identical subtrees (deep
+        # equality compares symbols and spans all the way down) and
+        # descend into the first nonterminal child pair that differs.
+        nxt = None
+        for ca, cb in zip(a["children"], b["children"]):
+            if not _node_is_nt(ca):
+                # A terminal slot of one production must be the very
+                # same input position on both sides; a mismatch here
+                # would mean the sealed trees do not tile the same input.
+                if ca != cb:
+                    raise ValueError("共享产生式的终结符子节点不是同一词元跨度，证据不一致")
+                continue
+            if ca != cb:
+                nxt = (ca, cb)
+                break
+        if nxt is None:
+            raise ValueError("两棵派生树结构完全相同，不存在歧义见证（不得生成伪证据）")
+        a, b = nxt
+
+    if a["symbol"] != b["symbol"]:
+        # Unreachable for trees of the same grammar at the same RHS slot;
+        # keep the error explicit rather than emitting a bogus witness.
+        raise ValueError(
+            f"首次分歧位于不同非终结符 {a['symbol']!r} 与 {b['symbol']!r}，"
+            "封存树可能来自不同文法"
+        )
+
+    return {
+        "shared_prefix": shared,
+        "divergence": {
+            "symbol": a["symbol"],
+            "span_first": list(a["span"]),
+            "span_second": list(b["span"]),
+            "first": {
+                "production": a["production"],
+                "subtree_summary": _subtree_summary(a),
+            },
+            "second": {
+                "production": b["production"],
+                "subtree_summary": _subtree_summary(b),
+            },
+        },
+        "alignment_rule": WITNESS_ALIGNMENT_RULE,
+        "derivation": (
+            "见证仅由已封存的 first/second 两棵有限派生树重新导出"
+            "（按节点符号与输入跨度对齐，不重新解析输入），重启后与原结论一致"
+        ),
+    }

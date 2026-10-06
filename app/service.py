@@ -2,9 +2,15 @@
 
 Endpoints
 ---------
-``GET  /healthz``                 liveness probe
-``POST /api/v1/analyze``          submit/replay a sealed determination
-``GET  /api/v1/conclusion/<id>``  fetch a sealed conclusion by audit id
+``GET  /healthz``                  liveness probe
+``POST /api/v1/analyze``           submit/replay a sealed determination
+``GET  /api/v1/conclusion/<id>``   fetch a sealed conclusion by audit id
+``GET  /api/v1/witness/<id>``      ambiguity witness for a sealed
+                                   conclusion: the shared structural
+                                   prefix and the first divergence of the
+                                   two sealed trees (re-derived from the
+                                   sealed trees only; unique/rejected
+                                   conclusions explicitly have none)
 
 Analysis outcomes (HTTP 200) all carry a ``verdict``:
 
@@ -69,6 +75,54 @@ def _loose_fingerprint(raw_body: bytes) -> str:
     return hashlib.sha256(raw_body).hexdigest()
 
 
+def _witness_view(audit_id: str, entry: dict) -> Tuple[int, dict]:
+    """Build the ambiguity-witness response for a sealed entry.
+
+    The witness is re-derived exclusively from the two finite trees
+    already sealed with the conclusion -- never from a fresh parse.  A
+    unique acceptance or a rejection has no ambiguity witness and says
+    so explicitly.
+    """
+    conclusion = entry["conclusion"]
+    verdict = conclusion.get("verdict")
+
+    base = {
+        "audit_id": audit_id,
+        "request_hash": entry["request_hash"],
+        "sealed_at": entry["sealed_at"],
+        "verdict": verdict,
+        "witness_available": False,
+    }
+
+    if verdict != engine.AMBIGUOUS:
+        reason_map = {
+            engine.UNIQUE: "唯一接受结论只封存了一棵派生树，不存在两棵树之间的歧义见证",
+            engine.REJECTED: "拒绝结论没有任何接受派生树，不存在歧义见证",
+        }
+        base["detail"] = reason_map.get(
+            verdict, f"结论 {verdict!r} 不封存两棵派生树，不存在歧义见证"
+        )
+        return 200, base
+
+    trees = conclusion.get("trees") or {}
+    first_tree, second_tree = trees.get("first"), trees.get("second")
+    if not isinstance(first_tree, dict) or not isinstance(second_tree, dict):
+        # Sealed evidence is internally inconsistent: report, never forge.
+        base["detail"] = "封存结论缺少两棵派生树，无法重新导出歧义见证"
+        return 200, base
+
+    try:
+        witness = engine.ambiguity_witness(first_tree, second_tree)
+    except ValueError as exc:
+        base["detail"] = f"无法从封存树重新导出歧义见证：{exc}"
+        return 200, base
+
+    base["witness_available"] = True
+    base["production_sequences"] = conclusion.get("production_sequences")
+    base["witness"] = witness
+    return 200, base
+
+
 class ArbiterHandler(BaseHTTPRequestHandler):
     server_version = "ForestArbiter/1.0"
 
@@ -100,16 +154,25 @@ class ArbiterHandler(BaseHTTPRequestHandler):
             self._write_json(200, PROTOCOL)
             return
         prefix = "/api/v1/conclusion/"
-        if path.startswith(prefix):
-            audit_id = unquote(path[len(prefix):])
+        witness_prefix = "/api/v1/witness/"
+        if path.startswith(prefix) or path.startswith(witness_prefix):
+            is_witness = path.startswith(witness_prefix)
+            tail = path[len(witness_prefix) if is_witness else len(prefix):]
+            audit_id = unquote(tail)
             if not audit_id or "/" in audit_id:
                 self._write_json(400, {"error": "BAD_AUDIT_ID",
                                        "detail": "审计标识缺失或非法"})
                 return
             entry = self.store.get(audit_id)
             if entry is None:
+                # Unknown ids keep the existing read semantics of the
+                # conclusion flow: 404, whether or not a witness was asked.
                 self._write_json(404, {"error": "NOT_FOUND",
                                        "detail": f"未找到审计标识 {audit_id!r} 的封存结论"})
+                return
+            if is_witness:
+                status, body = _witness_view(audit_id, entry)
+                self._write_json(status, body)
                 return
             self._write_json(200, {"replayed": True, **entry})
             return

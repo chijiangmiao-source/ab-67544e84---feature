@@ -33,6 +33,27 @@
 - 同标识 + 语义等价重传（与声明/产生式数组顺序无关，仅与内容有关）：回放原结论（`REPLAYED`），不重新计算。
 - 同标识 + 不同输入：`HTTP 409 AUDIT_ID_CONFLICT`，**保留并回传原证据**。
 
+## 歧义见证
+
+重开已封存的歧义接受结论时，审查员需要知道两棵稳定派生树**首次在何处作出不同选择**，
+而无需人工比对完整树。`GET /api/v1/witness/<audit_id>` 在既有按审计标识读取流程中返回：
+
+- `shared_prefix`：两树共享的最长结构前缀（共同经过的非终结符节点：符号、产生式编号、跨度）；
+- `divergence`：首次分歧的非终结符 `symbol` 与两侧词元跨度 `span_first` / `span_second`，
+  以及两侧采用的 `production` 和各自后续 `subtree_summary`
+  （符号/跨度/产生式/先序产生式序列/逐层子节点，终结符叶保留词元与跨度）。
+
+对齐规则与限制：
+
+- 对齐**仅依据派生节点的非终结符符号与输入跨度 `[i,j)` 推进**，不比较先序产生式编号。
+  因此空右部产生式以零跨度节点 `[i,i)` 参与对齐；同一产生式编号在不同跨度出现时不会误配；
+  左递归展开按其实际消费跨度定位到可复核的真实节点（如共享外层 `S[0,2]`，分歧在内层 `S[0,1]`）。
+- 见证**只从已封存的 first/second 两棵有限树重新导出**，不重新解析输入，
+  因而重启后与原结论保持一致（重复读取幂等）。
+- 对 `UNIQUE_ACCEPTED` 或 `REJECTED` 结论请求该视图：HTTP 200，`witness_available: false`
+  并以中文 `detail` 明确说明不存在歧义见证，**绝不生成伪证据**。
+- 未知审计标识沿用既有读取语义：HTTP 404 `NOT_FOUND`。
+
 ## HTTP
 
 `POST /api/v1/analyze`
@@ -51,7 +72,8 @@
 }
 ```
 
-- `GET /healthz` 健康响应；`GET /api/v1/conclusion/<audit_id>` 取回封存结论
+- `GET /healthz` 健康响应；`GET /api/v1/conclusion/<audit_id>` 取回封存结论；
+  `GET /api/v1/witness/<audit_id>` 查询歧义见证（见下）
 - 端口经环境变量配置：`ARBITER_HOST`（默认 `0.0.0.0`）、`ARBITER_PORT`（默认 `8080`）、
   `ARBITER_STORE`（默认 `/data/sealed.json`）
 - 纯 Python 标准库实现，无运行时第三方依赖
@@ -80,7 +102,7 @@ docker compose down -v   # 清理
 ## 本地开发与测试
 
 ```bash
-python3 -m unittest discover -s tests -v       # 40 项单元测试
+python3 -m unittest discover -s tests -v       # 52 项单元测试
 python3 -m app.service                          # 直接启动服务
 ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整验收
 ```
@@ -92,7 +114,7 @@ app/grammar.py    请求结构校验（限制/非法符号/悬空引用/首个�
 app/engine.py     静态分析（可生成性、不消费词元循环）+ Earley/SPPF 构建 + 稳定选树
 app/storage.py    语义指纹、封存、回放、冲突保留
 app/service.py    HTTP 服务
-tests/            引擎/封存/HTTP 单元测试
+tests/            引擎/歧义见证/封存/HTTP 单元测试
 scripts/          verify.py（冒烟）与 entrypoint.sh（验收编排）
 Dockerfile        仲裁服务镜像
 Dockerfile.verify 验收镜像（Python + 静态 docker CLI）
