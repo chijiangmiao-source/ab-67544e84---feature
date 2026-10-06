@@ -2,9 +2,12 @@
 
 Endpoints
 ---------
-``GET  /healthz``                 liveness probe
-``POST /api/v1/analyze``          submit/replay a sealed determination
-``GET  /api/v1/conclusion/<id>``  fetch a sealed conclusion by audit id
+``GET  /healthz``                         liveness probe
+``POST /api/v1/analyze``                  submit/replay a sealed determination
+``GET  /api/v1/conclusion/<id>``          fetch a sealed conclusion by audit id
+``GET  /api/v1/conclusion/<id>/witness``  ambiguity witness re-derived from
+                                          the two sealed trees (only for
+                                          ``AMBIGUOUS_ACCEPTED``)
 
 Analysis outcomes (HTTP 200) all carry a ``verdict``:
 
@@ -31,6 +34,7 @@ from urllib.parse import unquote, urlsplit
 from . import engine
 from .grammar import MAX_NONTERMINALS, MAX_PRODUCTIONS, MAX_TOKENS, ValidationError, build_grammar
 from .storage import ConflictError, SealedStore, canonical_fingerprint
+from .witness import witness_for_conclusion
 
 STORE_PATH = os.environ.get("ARBITER_STORE", "/data/sealed.json")
 
@@ -101,7 +105,11 @@ class ArbiterHandler(BaseHTTPRequestHandler):
             return
         prefix = "/api/v1/conclusion/"
         if path.startswith(prefix):
-            audit_id = unquote(path[len(prefix):])
+            rest = unquote(path[len(prefix):])
+            want_witness = rest.endswith("/witness")
+            if want_witness:
+                rest = rest[: -len("/witness")]
+            audit_id = rest
             if not audit_id or "/" in audit_id:
                 self._write_json(400, {"error": "BAD_AUDIT_ID",
                                        "detail": "审计标识缺失或非法"})
@@ -111,9 +119,43 @@ class ArbiterHandler(BaseHTTPRequestHandler):
                 self._write_json(404, {"error": "NOT_FOUND",
                                        "detail": f"未找到审计标识 {audit_id!r} 的封存结论"})
                 return
-            self._write_json(200, {"replayed": True, **entry})
+            if not want_witness:
+                self._write_json(200, {"replayed": True, **entry})
+                return
+            self._write_witness(audit_id, entry)
             return
         self._write_json(404, {"error": "NOT_FOUND", "detail": f"未知路径 {path}"})
+
+    # ------------------------------------------------------------------
+    def _write_witness(self, audit_id: str, entry: dict) -> None:
+        """Ambiguity-witness view over a sealed conclusion.
+
+        The witness is re-derived from the two finite trees sealed in
+        the entry, so it is stable across replays and restarts.  A
+        unique acceptance or a rejection has no two trees and therefore
+        no ambiguity witness -- stated explicitly, never fabricated.
+        """
+        conclusion = entry["conclusion"]
+        verdict = conclusion.get("verdict")
+        witness = witness_for_conclusion(conclusion)
+        if witness is None:
+            self._write_json(200, {
+                "audit_id": audit_id,
+                "verdict": verdict,
+                "witness": None,
+                "detail": (
+                    f"该封存结论的判定为 {verdict}，不存在两棵稳定派生树，"
+                    "因此不存在歧义见证；歧义见证仅对 AMBIGUOUS_ACCEPTED 结论可用"
+                ),
+            })
+            return
+        self._write_json(200, {
+            "audit_id": audit_id,
+            "verdict": verdict,
+            "sealed_at": entry["sealed_at"],
+            "request_hash": entry["request_hash"],
+            "witness": witness,
+        })
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path

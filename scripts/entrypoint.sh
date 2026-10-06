@@ -5,7 +5,9 @@
 #   2. build the arbiter image (explicit, ordered after the tests)
 #   3. HTTP smoke against ARBITER_BASE_URL (in Compose: the healthy
 #      "arbiter" service): unique / ambiguous / non-consuming-cycle,
-#      plus sealed replay and audit-id conflict
+#      plus sealed replay, audit-id conflict and the ambiguity-witness
+#      view (epsilon + left-recursion sample, no witness for
+#      non-ambiguous conclusions)
 #   4. exit 0 on full success, 1 otherwise
 set -uo pipefail
 
@@ -36,6 +38,6 @@ else
   exit 1
 fi
 
-echo "================ [3/3] HTTP 场景冒烟（唯一/歧义/无消费环/回放/冲突）================"
+echo "================ [3/3] HTTP 场景冒烟（唯一/歧义/无消费环/回放/冲突/歧义见证）================"
 echo "目标服务：${ARBITER_BASE_URL:?需设置 ARBITER_BASE_URL}"
 SKIP_UNIT_TESTS=1 python3 scripts/verify.py

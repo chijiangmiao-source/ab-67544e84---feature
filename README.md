@@ -33,6 +33,26 @@
 - 同标识 + 语义等价重传（与声明/产生式数组顺序无关，仅与内容有关）：回放原结论（`REPLAYED`），不重新计算。
 - 同标识 + 不同输入：`HTTP 409 AUDIT_ID_CONFLICT`，**保留并回传原证据**。
 
+## 歧义见证
+
+审查员重开一份 `AMBIGUOUS_ACCEPTED` 封存结论时，可查询两棵稳定派生树的**首次分歧见证**，
+无需人工比对完整树：
+
+`GET /api/v1/conclusion/<audit_id>/witness`
+
+- 见证**只从已封存的两棵有限树重新导出**，不重新运行分析；重放与重启后与原结论完全一致。
+- 对齐按派生节点的**（符号, 输入跨度）**并行推进，而非比较先序产生式编号序列——
+  因此空右部（ε）、同一产生式编号出现在不同跨度、左递归展开，都定位到可复核的实际节点。
+- 返回内容：
+  - `shared_prefix`：两树共享的最长结构前缀（从根到分歧点父节点的每一层符号/产生式/跨度，
+    以及继续下行的子节点序号）；
+  - `divergence`：首次分歧的非终结符及其词元跨度（两侧跨度不同时逐侧给出），
+    `kind` 为 `PRODUCTION_CHOICE`（同节点不同产生式）或 `SPAN_SPLIT`（同符号不同跨度覆盖）；
+  - `first` / `second`：两侧各自采用的产生式编号、跨度与后续子树摘要
+    （子树先序产生式序列、词元产出、节点数、深度）。
+- `UNIQUE_ACCEPTED` / `REJECTED` 结论请求该视图时返回 `witness: null` 并明确说明
+  **不存在歧义见证**（绝不生成伪证据）；未知审计标识仍按既有读取语义返回 `404 NOT_FOUND`。
+
 ## HTTP
 
 `POST /api/v1/analyze`
@@ -51,7 +71,8 @@
 }
 ```
 
-- `GET /healthz` 健康响应；`GET /api/v1/conclusion/<audit_id>` 取回封存结论
+- `GET /healthz` 健康响应；`GET /api/v1/conclusion/<audit_id>` 取回封存结论；
+  `GET /api/v1/conclusion/<audit_id>/witness` 取回歧义见证（见上节）
 - 端口经环境变量配置：`ARBITER_HOST`（默认 `0.0.0.0`）、`ARBITER_PORT`（默认 `8080`）、
   `ARBITER_STORE`（默认 `/data/sealed.json`）
 - 纯 Python 标准库实现，无运行时第三方依赖
@@ -80,7 +101,7 @@ docker compose down -v   # 清理
 ## 本地开发与测试
 
 ```bash
-python3 -m unittest discover -s tests -v       # 40 项单元测试
+python3 -m unittest discover -s tests -v       # 56 项单元测试
 python3 -m app.service                          # 直接启动服务
 ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整验收
 ```
@@ -90,9 +111,10 @@ ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整�
 ```
 app/grammar.py    请求结构校验（限制/非法符号/悬空引用/首个原因）
 app/engine.py     静态分析（可生成性、不消费词元循环）+ Earley/SPPF 构建 + 稳定选树
+app/witness.py    歧义见证：按（符号, 跨度）节点对齐的首次分歧视图（仅由封存树重新导出）
 app/storage.py    语义指纹、封存、回放、冲突保留
 app/service.py    HTTP 服务
-tests/            引擎/封存/HTTP 单元测试
+tests/            引擎/见证/封存/HTTP 单元测试
 scripts/          verify.py（冒烟）与 entrypoint.sh（验收编排）
 Dockerfile        仲裁服务镜像
 Dockerfile.verify 验收镜像（Python + 静态 docker CLI）

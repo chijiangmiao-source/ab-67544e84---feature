@@ -9,7 +9,10 @@ Order of operations (mirrors the acceptance contract):
 3. HTTP smoke against the running arbiter:
    unique acceptance, ambiguous acceptance with two stable trees,
    non-consuming-cycle rejection, equivalent retransmission replay,
-   audit-id conflict preserving the original evidence.
+   audit-id conflict preserving the original evidence, and the
+   ambiguity-witness view (stable divergence for an epsilon +
+   left-recursion sample, explicit absence for non-ambiguous
+   conclusions, 404 for unknown audit ids).
 
 Exits 0 only when every step passes; any failure exits 1.
 """
@@ -56,8 +59,11 @@ def http_post(path, payload):
 
 
 def http_get(path):
-    with urllib.request.urlopen(BASE_URL + path, timeout=10) as resp:
-        return resp.status, json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(BASE_URL + path, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 def wait_healthy():
@@ -209,6 +215,66 @@ def main() -> int:
     check("无限" in rej.get("detail", "") or "循环" in rej.get("detail", ""),
           "给出首个可操作中文原因")
 
+    step("步骤 3c：歧义见证查询（含空产生式与左递归的歧义样例）")
+    wid = f"verify-witness-{run_id}"
+    status, body = http_post("/api/v1/analyze", {
+        "audit_id": wid,
+        "nonterminals": ["S", "A", "B"],
+        "productions": [
+            {"id": 1, "lhs": "S", "rhs": ["A", "B"]},
+            {"id": 2, "lhs": "A", "rhs": ["A", "a"]},   # 左递归（消费词元）
+            {"id": 3, "lhs": "A", "rhs": []},           # 空产生式
+            {"id": 4, "lhs": "B", "rhs": ["a"]},
+            {"id": 5, "lhs": "B", "rhs": []},           # 空产生式
+        ],
+        "start": "S",
+        "tokens": ["a"],
+    })
+    res = body.get("result", {})
+    check(status == 200 and res.get("verdict") == "AMBIGUOUS_ACCEPTED",
+          f"含空产生式与左递归的样例歧义接受（实际 HTTP {status} {res.get('verdict')}）")
+    status, body = http_get(f"/api/v1/conclusion/{wid}/witness")
+    wit = body.get("witness") if status == 200 else None
+    check(status == 200 and isinstance(wit, dict),
+          f"歧义结论存在歧义见证（实际 HTTP {status}）")
+    prefix = (wit or {}).get("shared_prefix")
+    check(prefix == [{"depth": 0, "symbol": "S", "production": 1,
+                      "span": [0, 1], "diverging_child_index": 0}],
+          f"最长共享结构前缀定位到根节点 S[0,1]（实际 {prefix}）")
+    div = (wit or {}).get("divergence", {})
+    check(div.get("symbol") == "A" and div.get("kind") == "SPAN_SPLIT",
+          f"首次分歧的非终结符为 A 且为跨度分裂（实际 {div.get('symbol')} {div.get('kind')}）")
+    check(div.get("first", {}).get("production") == 2
+          and div.get("first", {}).get("span") == [0, 1]
+          and div.get("second", {}).get("production") == 3
+          and div.get("second", {}).get("span") == [0, 0],
+          "两侧产生式编号与词元跨度定位到可复核的实际节点："
+          f"first=产生式{div.get('first', {}).get('production')}@{div.get('first', {}).get('span')} "
+          f"second=产生式{div.get('second', {}).get('production')}@{div.get('second', {}).get('span')}")
+    s1 = div.get("first", {}).get("subtree_summary", {})
+    s2 = div.get("second", {}).get("subtree_summary", {})
+    check(s1.get("production_sequence") == [2, 3] and s1.get("yield") == ["a"]
+          and s2.get("production_sequence") == [3] and s2.get("yield") == [],
+          "各自后续子树摘要正确（含空右部节点的零词元产出）")
+    # Stability: the witness is re-derived from the sealed trees on every read.
+    status, body2 = http_get(f"/api/v1/conclusion/{wid}/witness")
+    check(status == 200 and body2.get("witness") == wit,
+          "见证可重复导出且与首次读取完全一致（重启/重放稳定）")
+    # Non-ambiguous conclusions must state the absence of a witness
+    # explicitly instead of fabricating evidence.
+    status, body = http_get(f"/api/v1/conclusion/{uid}/witness")
+    check(status == 200 and body.get("witness") is None
+          and "不存在歧义见证" in body.get("detail", ""),
+          f"唯一接受结论明确说明不存在歧义见证（实际 HTTP {status} witness={body.get('witness')}）")
+    status, body = http_get(f"/api/v1/conclusion/{cid}/witness")
+    check(status == 200 and body.get("witness") is None
+          and "不存在歧义见证" in body.get("detail", ""),
+          "拒绝结论同样明确说明不存在歧义见证，不生成伪证据")
+    # Unknown audit ids keep the existing read semantics.
+    status, body = http_get(f"/api/v1/conclusion/verify-unknown-{run_id}/witness")
+    check(status == 404 and body.get("error") == "NOT_FOUND",
+          f"未知审计标识按既有读取语义返回 404（实际 HTTP {status}）")
+
     return report()
 
 
@@ -220,7 +286,7 @@ def report() -> int:
             print(f"  - {f}")
         print("RESULT: FAIL")
         return 1
-    print("全部步骤通过：单元测试 / 镜像 / 唯一 / 歧义 / 无消费环 / 回放 / 冲突")
+    print("全部步骤通过：单元测试 / 镜像 / 唯一 / 歧义 / 无消费环 / 回放 / 冲突 / 歧义见证")
     print("RESULT: PASS")
     return 0
 
